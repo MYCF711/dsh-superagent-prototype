@@ -5,8 +5,9 @@ import { sameName } from '../infra/text.ts'
 import { GithubAccountsSchema } from '../deployment.ts'
 import { CliError, validItems, type Tally } from '../infra/commands.ts'
 import { ciCounts, ciFact, ciFailures, ciSummary, githubThreadContext, pullChecks } from './github-read.ts'
-import { branchCiTrigger, ciTrigger, commentTrigger, CommentSchema, githubAddress, issueTrigger, IssueSchema, pullTrigger, SOURCE }
+import { branchCiTrigger, ciTrigger, commentTrigger, CommentSchema, githubAddress, IssueSchema, pullTrigger, SOURCE }
   from './github-trigger.ts'
+import { receiveIssue, sweepDue, sweepHeldIssues } from './github-review.ts'
 import { githubLink, sendGithub } from './github-channel.ts'
 import type { GithubComment, PullRef } from './github-trigger.ts'
 import { observePull, pullsOf, readPull, type Pull } from './github-pull.ts'
@@ -25,7 +26,9 @@ const NotificationSchema = z.looseObject({
 const GithubConfigSchema = GithubAccountsSchema.extend({ pollSeconds: z.number().int().min(60).max(3600).default(60),
   failuresBeforeError: z.number().int().min(1).max(20).default(3),
   observeIssues: z.boolean().default(false), observePulls: z.boolean().default(false), observeComments: z.boolean().default(false),
-  observeCi: z.boolean().default(false) }).strict()
+  observeCi: z.boolean().default(false),
+  // Experimental: a new Issue without a reproducible report is held before any Eval instead of being assessed.
+  reviewIssues: z.boolean().default(false), reviewHours: z.number().int().min(1).max(720).default(48) }).strict()
 export type GithubConfig = z.infer<typeof GithubConfigSchema>
 const OBSERVED = { issues: 'observeIssues', pulls: 'observePulls', comments: 'observeComments', ci: 'observeCi' } as const
 type Scope = keyof typeof OBSERVED
@@ -54,7 +57,11 @@ export const githubKind: SourceKind<GithubConfig> = {
     { key: 'observeComments', type: 'switch', label: { zh: '接收仓库里的评论', en: 'Receive comments in the repository' },
       hint: { zh: '打开后，Issue 和 PR 上没有 @ 智能体的评论和代码评论也会收到，由策略的接收表决定是否成为候选。', en: 'Comments and review comments on Issues and PRs that do not mention the agent are received too, and the Policy\'s admission table decides whether they become candidates.' } },
     { key: 'observeCi', type: 'switch', label: { zh: '接收默认分支的 CI', en: 'Receive the default branch\'s CI' },
-      hint: { zh: '打开后，默认分支的 CI 失败和恢复会收到，由策略的接收表决定是否成为候选。', en: 'Failures of the default branch\'s CI, and its recovery, are received, and the Policy\'s admission table decides whether they become candidates.' } }],
+      hint: { zh: '打开后，默认分支的 CI 失败和恢复会收到，由策略的接收表决定是否成为候选。', en: 'Failures of the default branch\'s CI, and its recovery, are received, and the Policy\'s admission table decides whether they become candidates.' } },
+    { key: 'reviewIssues', type: 'switch', label: { zh: '实验性：评审新 Issue', en: 'Experimental: review new Issues' },
+      hint: { zh: '打开后，新 Issue 先检查有没有可复现的信息：读不出信息的先不交给智能体，而是打上 needs-info、回一条说明缺什么的评论，等作者补充。默认关闭。', en: 'New Issues are checked for a reproducible report first: one that carries none is not handed to the agent but labeled needs-info and answered once with what is missing. Off by default.' } },
+    { key: 'reviewHours', type: 'number', advanced: true, min: 1, max: 720, label: { zh: '评审等待 / 小时', en: 'Review wait / hours' },
+      hint: { zh: '被留下的 Issue 在这段时间内没有补充就关闭；期间补全信息会自动放行。', en: 'A held Issue is closed after this long without the missing details; completing them meanwhile releases it automatically.' } }],
   // What the Source observes across the repository it receives in full; elsewhere, only what addresses the agent.
   scope: ({ meta }, config) => {
     const row = scopeOf(meta)
@@ -185,6 +192,11 @@ async function pollRepository(ctx: SourceContext, round: Round): Promise<void> {
     try { await readStream(ctx, round, stream.id, stream.path, config) }
     catch (error) { if (!stopped(ctx, round)) round.failures.push(`${stream.id}: ${String(error)}`) }
   }
+  // The review re-reads its held Issues at its own pace: at most every ten minutes, and never in a stopped round.
+  if (config.reviewIssues && sweepDue(ctx)) {
+    try { await sweepHeldIssues(ctx, round.signal, config) }
+    catch (error) { if (!stopped(ctx, round)) round.failures.push(`issue review: ${String(error)}`) }
+  }
   // When CI observation is turned off, clear the failure baseline but preserve the revision counter so future triggers have unique IDs.
   if (!config.observeCi) {
     const seen = ctx.state.get(KV.github.branchCi)
@@ -229,7 +241,8 @@ async function readStream(ctx: SourceContext, round: Round, id: string, path: st
       const issue = IssueSchema.safeParse(item)
       const pr = issue.success && !!issue.data.pull_request
       if (!issue.success || !fresh(issue.data.created_at, pr ? 'pulls' : 'issues')) continue
-      await ctx.receive(pr ? pullTrigger(issue.data, login) : issueTrigger(issue.data, login))
+      if (pr) await ctx.receive(pullTrigger(issue.data, login))
+      else await receiveIssue(ctx, issue.data, config)
       nameThread(ctx, issue.data.number, issue.data.title)
       continue
     }
@@ -353,7 +366,8 @@ async function readNotified(ctx: SourceContext, round: Round, number: number, it
       // A mention added by a later edit to the body is not read: only the author can be the actor of the body.
       const { login } = ctx.deployment.github
       const opened = Date.parse(issue.created_at) >= Date.parse(since) && !sameName(issue.user.login, login)
-      if (opened) await ctx.receive(issueTrigger(issue, login))
+      const config = ctx.config<GithubConfig>(SOURCE)
+      if (opened && config) await receiveIssue(ctx, issue, config)
       await intakeComments(ctx, { number, isPr: false, url: issue.html_url }, since, round)
       nameThread(ctx, number, issue.title)
     }
