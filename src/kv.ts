@@ -6,6 +6,7 @@ import type { PromptVersion } from './app/prompts.ts'
 import type { SettingsVersion } from './app/store.ts'
 import type { SettingsSave } from './policy.ts'
 import type { Retry } from './sources/github.ts'
+import type { HeldIssue } from './sources/github-review.ts'
 
 /** Key of a KV record whose value has type `V`; a plain string represents an untyped key. */
 export type Key<V> = string & { readonly __value?: V }
@@ -40,13 +41,15 @@ export const KV = {
   sources: { labels: family<Record<string, string>, [source: string]>('source-labels:') },
   /**
    * GitHub Source: notification cursor and pending retries; per-Issue/PR read cursor shared by notification and polled reads;
-   * per-stream cursor, start times by kind, and ETag; default-branch CI state; and per-PR CI fingerprint and revision (`revision`
-   * counts reported CI changes so each produces a distinct Trigger ID).
+   * per-stream cursor, start times by kind, and ETag; default-branch CI state; per-PR CI fingerprint and revision (`revision`
+   * counts reported CI changes so each produces a distinct Trigger ID); and the Issues the optional review holds, with the
+   * time of its last sweep.
    */
   github: { since: record<string>('github-since'), retries: record<Record<string, Retry>>('github-retry'),
     cursor: family<string, [number: number]>('github-cursor:'),
     stream: family<{ since: string; started: Record<string, string>; etag?: string }, [stream: string]>('github-stream:'),
     branchCi: record<{ branch?: string; failures?: string[]; revision: number }>('github-branch-ci'),
+    held: record<Record<string, HeldIssue>>('github-review-held'), reviewSwept: record<string>('github-review-swept'),
     ci: family<{ fingerprint: string; revision: number }, [number: number]>('github-ci:') },
   /**
    * Feishu Source: known chats (`true` for direct messages); per-chat history cursor and active topics mapped from topic ID
